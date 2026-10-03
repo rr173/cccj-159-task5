@@ -244,7 +244,10 @@ class ECOService:
         for m in affected:
             if m in edits:
                 mods[m] = {"netlist": edits[m]["netlist"],
-                           "version": base_modules[m]["version"] + 1}
+                           "version": base_modules.get(m, {"version": 0})["version"] + 1}
+            elif m not in mods:
+                # 模块来自影响闭包（版本化实例拓扑），基线尚无网表时以拓扑节点占位
+                mods[m] = {"netlist": f"MODULE {m}; // 来自影响闭包拓扑节点", "version": 1}
         return mods
 
     def _dispatch(self, c, eco):
@@ -294,17 +297,61 @@ class ECOService:
         rows = c.execute(q, args).fetchall()
         return [dict(r) for r in rows if r["eco_id"] != exclude_eco]
 
-    def freeze_eco(self, eco_id: str, by: str) -> dict:
+    def freeze_eco(self, eco_id: str, by: str, change_id: str | None = None) -> dict:
         """提交 ECO：冻结网表/约束/受影响模块/验证矩阵并触发检查。
 
         模块被占用时不冻结，转入 QUEUED 排队并登记阻塞关系。
+        携带 change_id 时先过**电路影响闭包门禁**：进入审核前必须存在绑定最新
+        拓扑版本与当前变更摘要的 CURRENT 闭包快照（旧结果一律拒绝），冻结成功后
+        把复验模块并集写入 affected_modules 并把变更固化为 FROZEN。
         """
+        impact = None
+        closure_view = None
+        if change_id:
+            # 闭包门禁前置：只读校验；拒绝在**独立已提交事务**留痕，不随主事务回滚丢失
+            from .impact import ImpactError, ImpactService
+            impact = ImpactService(self.s, self)
+            with self.s.tx() as c:
+                chg0 = impact._change_dict(c, change_id)
+                stale = impact._stale_reason(c, chg0)
+                snap0 = impact._current_snapshot(c, change_id, chg0["current_snapshot_id"])
+                snap0_id = chg0["current_snapshot_id"]
+            if stale:
+                impact._deny("gate.denied", change_id, snap0_id, by,
+                             {"reason": stale, "eco_id": eco_id, "at": "eco.freeze"})
+                raise ImpactError(
+                    "CLOSURE_STALE_FOR_FREEZE",
+                    f"影响闭包已过期，不得冻结/发布：{stale}", 409)
+            if not snap0:
+                impact._deny("gate.denied", change_id, snap0_id, by,
+                             {"reason": "NO_CURRENT_SNAPSHOT", "eco_id": eco_id})
+                from .impact import ImpactError as _IE
+                raise _IE("NO_CURRENT_SNAPSHOT",
+                          "进入审核前必须先计算电路影响闭包", 409)
+
         with self.s.tx() as c:
             eco = self._get_eco(eco_id)
             if eco["status"] not in ("DRAFT", "REBASE_REQUIRED"):
                 raise ECOError("NOT_FREEZABLE",
                                f"状态 {eco['status']} 不可冻结", 409)
-            modules = json.loads(eco["affected_modules_json"])
+            if change_id:
+                # 主事务内再校验一次（前置校验与本事务之间可能发生更新）
+                chg = impact._change_dict(c, change_id)
+                stale = impact._stale_reason(c, chg)
+                if stale:
+                    raise ImpactError(
+                        "CLOSURE_STALE_FOR_FREEZE",
+                        f"影响闭包已过期，不得冻结/发布：{stale}", 409)
+                snap = impact._current_snapshot(c, change_id, chg["current_snapshot_id"])
+                if not snap:
+                    raise ImpactError("NO_CURRENT_SNAPSHOT",
+                                      "进入审核前必须先计算电路影响闭包", 409)
+                closure_view = impact._snapshot_view(c, snap)
+                # 复验范围 = 人工排除后仍有效的闭包节点，与 ECO 自报模块取并集
+                modules = sorted(set(closure_view["result"]["effective_nodes"])
+                                 | set(json.loads(eco["affected_modules_json"])))
+            else:
+                modules = json.loads(eco["affected_modules_json"])
             edits = json.loads(eco["edits_json"])
             conflicts = self._lock_conflicts(c, modules, exclude_eco=eco_id)
             if conflicts:
@@ -330,24 +377,30 @@ class ECOService:
                                  note=f"{eco_id} 冻结于 {trunk['base_id']}")
             fp = snapshot_fingerprint(snap)
             epoch = eco["freeze_epoch"] + 1
+            closure_snap_id = closure_view["id"] if closure_view else None
             c.execute(
                 "UPDATE eco SET status='FROZEN',submitted_at=COALESCE(submitted_at,?),"
                 "frozen_at=?,parent_baseline_id=?,base_revision_at_freeze=?,"
-                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?"
-                " WHERE id=?",
+                "constraints_version_at_freeze=?,snapshot_json=?,fingerprint=?,freeze_epoch=?,"
+                "affected_modules_json=? WHERE id=?",
                 (utcnow(), utcnow(), trunk["base_id"], trunk["base_revision"],
                  trunk["constraints_version"], json.dumps(snap, ensure_ascii=False), fp,
-                 epoch, eco_id))
+                 epoch, json.dumps(modules), eco_id))
             self._supersede_runs(c, eco_id, "refreeze")
             self._void_signoffs(c, eco_id, "ECO refrozen: epoch/fingerprint changed")
             for m in modules:
                 # 重冻结（rebase/合并后）时锁可能仍属于本 ECO
                 c.execute("INSERT OR IGNORE INTO module_lock(module,eco_id,acquired_at)"
                           " VALUES(?,?,?)", (m, eco_id, utcnow()))
+            if change_id:
+                # 同一事务固化变更：闭包快照与冻结基线绑定，审计双侧可对账
+                from .impact import ImpactService
+                ImpactService(self.s, self).mark_frozen(c, change_id, eco_id, by)
             eco = self._get_eco(eco_id)
             self._dispatch(c, eco)
             self._audit(c, "eco.freeze", eco_id, by,
-                        {"fingerprint": fp, "epoch": epoch, "modules": modules})
+                        {"fingerprint": fp, "epoch": epoch, "modules": modules,
+                         "change_id": change_id, "closure_snapshot_id": closure_snap_id})
             return self.eco_detail(eco_id, c)
 
     def abort_eco(self, eco_id, by):

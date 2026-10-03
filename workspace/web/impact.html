@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>电路影响闭包分析</title>
+<style>
+  :root { --bg:#0f1522; --panel:#182030; --line:#2a3550; --txt:#dbe4f3;
+          --mut:#8494b3; --ok:#2fbf71; --bad:#e0556b; --warn:#e3a73a;
+          --accent:#4f8cff; --block:#6b7894; --vio:#b574ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",monospace;
+         background:var(--bg); color:var(--txt); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex;
+           align-items:center; gap:14px; background:#121a29; }
+  header h1 { font-size:16px; margin:0; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:5px;
+           padding:6px 12px; cursor:pointer; font-size:12px; }
+  button.sec { background:#2c3a55; } button.danger{background:var(--bad);}
+  button.warn{background:#8a5a18;}
+  button:disabled { background:#333d52; color:#7c88a1; cursor:not-allowed; }
+  input,select,textarea { background:#0d1320; color:var(--txt); border:1px solid var(--line);
+           border-radius:4px; padding:5px 8px; font-size:12px; font-family:inherit; }
+  textarea { width:100%; min-height:54px; }
+  .wrap { display:grid; grid-template-columns: 300px 1fr 360px; gap:14px; padding:14px 22px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+           padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:#9fb4da; letter-spacing:1px;
+              text-transform:uppercase; }
+  .card { border:1px solid var(--line); border-radius:7px; padding:9px 11px; margin-bottom:8px;
+          background:#121a29; cursor:pointer; }
+  .card.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .card.stale { opacity:.65; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:6px 0; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; }
+  .t-CURRENT{background:#1e4a7a;color:#cfe3ff} .t-SUPERSEDED{background:#4a202a;color:#f3c3cd}
+  .t-READY{background:#155a38;color:#bdf3d5} .t-OPEN{background:#37425c;color:#c6d0e6}
+  .t-FROZEN{background:#4a2a66;color:#e7d1ff}
+  .chk { font-size:10.5px; padding:0 6px; border-radius:4px; margin:1px; display:inline-block;
+         background:#22304a; color:#aebfe0; border:1px solid #2f3f5f;}
+  .chk.CDC{background:#4a2a3a;color:#ffc6dd;border-color:#7a3a55}
+  .chk.CONTRACT{background:#4a3a1e;color:#ffe0ae;border-color:#7a5a2e}
+  .chk.POLICY{background:#3a2a55;color:#dcc6ff;border-color:#5a3f80}
+  .chk.LEC{background:#1e4a3a;color:#b8f0d6}
+  .chk.CONSTRAINT{background:#1e3f55;color:#bfe0ff}
+  .mandatory { color:var(--bad); font-weight:700; }
+  .excluded { opacity:.45; text-decoration:line-through; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td,th { padding:5px 7px; border-bottom:1px solid #222d44; text-align:left; vertical-align:top;}
+  th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--panel);}
+  .mut{color:var(--mut)} .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px}
+  pre { white-space:pre-wrap; word-break:break-all; background:#0b111c; border:1px solid var(--line);
+        border-radius:6px; padding:8px; font-size:11px; max-height:260px; overflow:auto;}
+  #toast { position:fixed; right:18px; bottom:18px; max-width:460px; display:flex;
+           flex-direction:column; gap:8px; z-index:9; }
+  .toast { padding:9px 13px; border-radius:7px; background:#20304d; border:1px solid var(--line);
+           font-size:12px; } .toast.err{border-color:var(--bad);} .toast.ok{border-color:var(--ok);}
+  .edge { border-left:3px solid var(--accent); padding:5px 9px; margin:5px 0;
+          background:#0e1626; border-radius:0 6px 6px 0; font-size:11.5px;}
+  .edge.cross { border-left-color:var(--bad); }
+  .edge.contract { border-left-color:var(--warn); }
+  .edge.policy { border-left-color:var(--vio); }
+  .edge.structural { border-left-color:var(--block); background:#11151f; color:#b6c1d6; }
+  .t-origin{background:#1e4a7a;color:#cfe3ff}
+  .t-active{background:#23403a;color:#b6e8d2}
+  .t-struct{background:#2a3142;color:#aeb9cf}
+  .ban { background:#3a1f28; border:1px solid #6e3346; color:#ffc3d0; border-radius:6px;
+         padding:7px 10px; font-size:11.5px; margin:6px 0;}
+  .okbox { background:#16352a; border:1px solid #26604a; color:#bde8d2; border-radius:6px;
+           padding:7px 10px; font-size:11.5px; margin:6px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .num{font-size:18px;font-weight:700}
+  .path { color:var(--mut); font-size:11px; }
+  .audit { font-size:11.5px; padding:6px 0; border-bottom:1px dashed #26324c; }
+  .audit .act{color:#9fc0ff} .audit.auto .act{color:#7fe3b0} .audit.manual .act{color:var(--warn)}
+  .audit.deny .act{color:var(--bad)}
+  details summary { cursor:pointer; color:var(--mut); font-size:11.5px; }
+  a { color:#9fc0ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔌 电路影响闭包分析</h1>
+  <span class="mut" id="topo-info"></span>
+  <span style="flex:1"></span>
+  <a class="tag t-OPEN" href="/" style="text-decoration:none">← ECO 签核工作台</a>
+  <button class="sec" onclick="loadAll()">刷新</button>
+</header>
+
+<div class="wrap">
+<!-- 左栏：拓扑版本 + 变更单 -->
+<div>
+  <div class="panel">
+    <h2>① 版本化拓扑</h2>
+    <div class="row mut" style="font-size:11.5px">模块实例关系 / 时钟域 / 约束引用。
+      上传<b>新版本</b>后旧闭包立即失效，不得用于冻结或发布。</div>
+    <div id="topo-list" class="mono"></div>
+    <details><summary>上传新拓扑版本（JSON）</summary>
+      <textarea id="topo-new" class="mono" placeholder='{"nodes":[...],"edges":[...],"constraints":[...]}'></textarea>
+      <div class="row"><input id="topo-note" style="flex:1" placeholder="版本说明"/>
+        <button onclick="uploadTopology()">上传新版本</button></div>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>② 变更单（修改起点）</h2>
+    <div class="grid2"><input id="c-title" placeholder="变更标题，如 ALU 位宽扩展"/>
+      <input id="c-owner" placeholder="设计人员" value="wei.dong"/></div>
+    <input id="c-origins" style="width:100%" placeholder="修改起点模块 id（逗号分隔），如 alu,core"/>
+    <textarea id="c-summary" placeholder='变更摘要 JSON：{"description":"...","issue":"JIRA-123"}'></textarea>
+    <div class="row"><button onclick="createChange()">创建并自动计算闭包</button></div>
+    <div id="change-list"></div>
+  </div>
+</div>
+
+<!-- 中栏：闭包结果 -->
+<div>
+  <div class="panel">
+    <h2>③ 必须复验的模块与检查类型
+      <span id="snap-tag"></span></h2>
+    <div id="gate-banner"></div>
+    <div class="row" style="justify-content:space-around;text-align:center">
+      <div><div class="num" id="st-total">-</div><div class="mut">闭包节点</div></div>
+      <div><div class="num mandatory" id="st-man">-</div><div class="mut">强制(不可排除)</div></div>
+      <div><div class="num" id="st-opt" style="color:var(--warn)">-</div><div class="mut">可排除候选</div></div>
+      <div><div class="num" style="text-decoration:line-through;color:var(--mut)" id="st-exc">-</div><div class="mut">已人工排除</div></div>
+      <div><div class="num" id="st-eff" style="color:var(--ok)">-</div><div class="mut">最终复验范围</div></div>
+    </div>
+    <div class="row">
+      <button onclick="recompute()">重新计算</button>
+      <button class="sec" onclick="editChange()">保存起点/摘要编辑（旧快照将失效）</button>
+      <button class="warn" onclick="markReady()">标记可进入审核（冻结门禁）</button>
+      <span id="bind-info" class="mut mono"></span>
+    </div>
+    <div id="err-box"></div>
+    <table>
+      <thead><tr><th>模块</th><th>时钟域</th><th>层级</th><th>必做检查</th><th>状态/操作</th></tr></thead>
+      <tbody id="nodes-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>④ 每条传播边的解释（为什么要复验它）</h2>
+    <div id="edges-box" class="mut">选择一个变更查看传播路径。</div>
+  </div>
+</div>
+
+<!-- 右栏：节点详情 + 审计 -->
+<div>
+  <div class="panel">
+    <h2>⑤ 节点复验依据</h2>
+    <div id="node-detail" class="mut">点击中间表格的模块名查看传播路径、强制理由与排除操作。</div>
+  </div>
+  <div class="panel">
+    <h2>⑥ 审计：自动结论 + 人工覆盖</h2>
+    <div class="row mut" style="font-size:11px">
+      <span class="auto">绿色=自动计算</span>
+      <span class="manual">黄色=人工排除/撤销</span>
+      <span class="deny">红色=门禁拒绝</span>
+    </div>
+    <div id="audit-box" class="mono"></div>
+  </div>
+</div>
+</div>
+<div id="toast"></div>
+<script src="/static/impact.js"></script>
+</body>
+</html>

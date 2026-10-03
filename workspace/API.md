@@ -148,6 +148,82 @@ POST .../complete       → {gen:1, lease_token, fingerprint, verdict}
 | POST | `/api/constraints` | `{delta:{...}, by, note}` 存在 RELEASING 单时 409；否则在验 FROZEN 单全部转 REBASE_REQUIRED |
 | POST | `/api/admin/reset` | 重置为种子数据 |
 
+## 电路影响闭包（进入审核前自动复验范围分析）
+
+操作页 `GET /impact`，API 前缀 `/api/impact`。系统接收**版本化拓扑**（模块实例关系
+`nodes`、时钟域 `clock_domain`、传播边 `edges`、约束引用 `constraints`），依据
+**修改起点**（origins）生成必须复验的模块闭包与每节点的检查类型，并为每条传播边
+给出中文解释。设计人员可排除**可选候选**（必须填理由）；跨时钟、接口契约、策略
+强制节点和修改起点**不可排除**。
+
+### 拓扑与检查类型
+
+- 节点 `nodes[]`：`id`、`name`、`clock_domain`（可多域 `CLK_A|CLK_B`）、
+  `interface`（对外接口边界，强制）、`policy_forced/policy_reason`（策略强制）、
+  固有 `checks`。
+- 边 `edges[]` 的 `kind`：`instance`（父→子例化）/`dataflow`/`clock`/`reset`/
+  `contract`（接口契约）/`policy`（策略）/`constraint`（约束，亦可由 constraints 隐式生成）；
+  可选 `crossing`（显式跨时钟）、`registered`（寄存器切割，不判组合环）、`name`、`checks`。
+- 传播活性：沿信号/时钟/复位/契约/策略/约束/正向例化边到达的为**变更传播(active)**；
+  子模块修改时沿**反向例化边**上溯到的父/祖父为**结构上溯(structural)**——只做集成级
+  SIM/TIMING 复验，可人工排除，且不再向下例化或沿父的信号边扇出到无关兄弟子树。
+- 检查类型：`SIM/TIMING/CDC/CONTRACT/CONSTRAINT/POLICY/RESET/LEC`（起点带 LEC；
+  跨时钟边两端带 CDC 且强制；契约/策略/约束目标强制）。
+
+### 快照绑定与陈旧门禁（关键不变量）
+
+- 快照 `closure_snapshot` 不可变，绑定**拓扑内容指纹 + 起点 + 变更摘要**（`content_fp`）。
+- **相同输入返回原快照**（`reused:true`；曾被作废的同输入快照重算时重新提升 repromote）。
+- **并发重算只保留一个当前版本**：同 change 串行化 + 唯一 `(change_id,content_fp)`，
+  提交时把旧 `CURRENT` 整批置 `SUPERSEDED`，任意时刻 `is_current=1` 恰有一条。
+- **拓扑上传新版本或编辑起点/摘要后，旧快照立即失效**（`current_snapshot_id=NULL`，
+  `stale_reason` 给出 `v1 → v2` 等可操作原因）；旧结果**不得用于冻结或发布**，
+  `POST .../ready` 与带 `change_id` 的 ECO `freeze` 一律 `409 CLOSURE_STALE_FOR_FREEZE`。
+- 手动重算默认追赶最新拓扑（`change.retopology` 审计）；可显式 `topology_version`
+  基于指定版本，或 `keep_version:true` 保持当前版本。
+
+### 可操作错误
+
+| 原因码 | 含义 | detail |
+|---|---|---|
+| `TOPOLOGY_INVALID` | 缺失/重复节点、坏边、未知边类型或检查类型（**聚合返回全部问题**） | `issues[]{where,problem,node,fix}` |
+| `ORIGIN_NOT_FOUND` | 修改起点不在拓扑 | `missing[]`、`candidates{}`（编辑距离近似）、`fix` |
+| `EMPTY_ORIGIN` | 未提供修改起点 | — |
+| `CLOSURE_CYCLE` | 前向传播图存在长度≥3 的环 | `cycle[]`（环路径）、`fix`（打断或 `registered:true`）|
+| `CLOSURE_TOO_LARGE` | 闭包超 `max_nodes`（默认 5000） | `reached/max_nodes/fix` |
+| `REASON_REQUIRED` | 人工排除未填理由（400） | `node_id/fix` |
+| `EXCLUSION_FORBIDDEN` | 排除跨时钟/接口契约/策略/起点强制节点（409） | `mandatory_reasons[]/fix` |
+| `NODE_NOT_IN_CLOSURE` | 排除了不在当前闭包内的节点（404） | `closure_nodes[]` |
+| `CLOSURE_STALE_FOR_FREEZE` | 拓扑/起点/摘要已变，旧闭包不得冻结发布（409） | `fix` |
+| `NO_CURRENT_SNAPSHOT` | 尚无当前闭包，需先计算 | — |
+| `CHANGE_FROZEN` | 已随 ECO 冻结，不可再改/重算/排除 | — |
+
+### 审计：自动结论 + 人工覆盖
+
+`impact_audit` 追加写，`GET /api/impact/audit?change_id=&action=&limit=` 可查：
+`snapshot.compute/reuse/repromote`（自动）、`snapshot.invalidate/change.retopology`
+（系统失效）、`exclude.add/exclude.revert`（人工覆盖/撤销）、`exclude.denied/
+gate.denied`（强制冲突与门禁拒绝，**用独立已提交事务留痕，不随业务事务回滚**）、
+`gate.ready/change.frozen`。
+
+### 端点
+
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| POST | `/api/impact/topologies` | `{topology:{nodes,edges,constraints}, by, note, topology_id?}`；内容相同幂等复用（200 `reused`），新版本 201 并使未冻结变更闭包失效 |
+| GET | `/api/impact/topologies` / `.../{version}` | 版本列表 / 某版本完整拓扑 |
+| POST | `/api/impact/changes` | `{title, owner, origins[], summary{}, topology_version?, max_nodes?}` → 201，**创建即自动计算闭包** |
+| GET | `/api/impact/changes` / `.../{id}` | 列表（含 `stale`）/ 详情（含 `closure`、`stale_reason`）|
+| POST | `/api/impact/changes/{id}/compute` | `{by, max_nodes?, keep_version?, topology_version?}` 重算（默认追赶最新拓扑）|
+| POST | `/api/impact/changes/{id}/edit` | `{origins?, summary?, title?, by}` 编辑后旧快照失效 |
+| POST | `/api/impact/changes/{id}/exclude` | `{node_id, reason(必填), by}` 排除可选候选 |
+| POST | `/api/impact/changes/{id}/unexclude` | `{node_id, by}` 撤销人工排除 |
+| POST | `/api/impact/changes/{id}/ready` | 冻结门禁：闭包须当前有效，通过后置 READY |
+| GET | `/api/impact/snapshots/{id}` | 不可变快照（含 effective/excluded 节点、传播边解释、排除理由）|
+| GET | `/api/impact/audit` | `?change_id=&action=&limit=` 自动结论与人工覆盖审计 |
+| GET | `/api/impact/catalog` | 检查类型目录 |
+| POST | `/api/ecos/{id}/freeze` | 额外支持 `{change_id}`：先过闭包门禁，冻结复验范围取闭包 effective 节点并集；过期闭包 `409 CLOSURE_STALE_FOR_FREEZE` |
+
 ## 独立设计签名封装 API
 
 基础路径同主机，默认端口 `8090`，页面 `GET /envelopes`，API 前缀 `/api/envelope`。

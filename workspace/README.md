@@ -65,6 +65,32 @@
   （`STALE_SUPERSEDED`）、依赖门禁（`DEPENDENCY_BLOCKED`），FAIL 仍只能走既有
   `rerun`，双签与两阶段发布约束完全不变；ECO 侧 `rejected_result` 与租约侧审计双侧留痕。
 
+## 电路影响闭包（进入审核前自动计算复验范围）
+
+在 ECO 冻结/审核**之前**，系统先对**版本化拓扑**（模块实例关系、时钟域、约束引用）
+依据**修改起点**自动计算电路影响闭包，操作页 `/impact`，API 前缀 `/api/impact`。
+
+- **版本化拓扑**：`nodes`（实例/时钟域/接口边界/策略强制）、`edges`（例化/数据流/
+  跨时钟/接口契约/策略/时钟/复位）、`constraints`（约束引用）。内容寻址、版本只增不改。
+- **必复验模块 + 检查类型**：闭包给每个节点推导 `SIM/TIMING/CDC/CONTRACT/
+  CONSTRAINT/POLICY/RESET/LEC`；每条传播边附**中文解释**（操作页逐条说明为什么要复验）。
+  传播区分**变更传播(active)**与**结构上溯(structural)**：改子模块会上溯例化它的
+  父/祖父做集成复验，但不会经父模块扇出到无关兄弟子树。
+- **人工排除**：可选候选可排除但**必须填理由**；修改起点、跨时钟边两端、接口契约、
+  策略规定、对外接口边界节点**不可排除**（`EXCLUSION_FORBIDDEN`，回显强制理由）。
+- **快照绑定 + 陈旧门禁**：快照绑定「拓扑内容指纹 + 起点 + 变更摘要」。**相同输入返回
+  原快照**；**并发重算只保留一个当前版本**（旧的整批 SUPERSEDED）；上传新拓扑或编辑
+  起点/摘要后旧快照立即失效，**旧结果不得用于冻结或发布**（`ready` 与带 `change_id`
+  的 ECO `freeze` 均以 `CLOSURE_STALE_FOR_FREEZE` 拒绝，冻结时复验范围取闭包
+  effective 节点并集）。
+- **可操作错误**：环（`CLOSURE_CYCLE`，给环路径与打断/registered 建议）、缺失节点
+  （`TOPOLOGY_INVALID` 聚合全部问题并给 fix；`ORIGIN_NOT_FOUND` 给近似候选）、
+  超大闭包（`CLOSURE_TOO_LARGE`，给当前规模/上限）、人工排除冲突
+  （`REASON_REQUIRED`/`EXCLUSION_FORBIDDEN`）。
+- **双侧审计**：`impact_audit` 同时记录自动结论（compute/reuse/repromote/invalidate）
+  与人工覆盖（exclude.add/revert/denied、gate.denied/ready/frozen），拒绝用独立已提交
+  事务留痕，不随业务事务回滚。
+
 ## 快速开始
 
 ```bash
@@ -75,6 +101,8 @@ python3 -m app.api --db data/eco.db --port 8080 --lease-ttl 600
 open http://localhost:8080
 # Runner 验证执行租约操作页（待领/持有者/剩余时间/接管/审计）
 open http://localhost:8080/ops
+# 电路影响闭包分析页（版本化拓扑/必复验模块/传播边解释/人工排除/审计）
+open http://localhost:8080/impact
 
 # 启动独立的设计签名封装服务（默认 8090，SQLite + 内容寻址 blob 落盘）
 python3 -m app.envelope_api --db data/envelope.db --port 8090
@@ -86,7 +114,7 @@ python3 -m app.envelope_cli --db data/envelope.db demo
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（84 个：原 ECO/租约/API 73 个 + 签名封装 11 个）
+# 全部测试（120 个：原 ECO/租约/API 73 个 + 签名封装 11 个 + 影响闭包 36 个）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -103,7 +131,10 @@ app/
   ed25519.py        零第三方依赖的 RFC 8032 Ed25519 签名/验签
   envelope_cli.py   封装、上传、签名、发布、验真、导出 CLI
   envelope_api.py   stdlib HTTP REST + `/envelopes` 页面
-  api.py      stdlib HTTP REST 路由（ECO + 租约两组 API）
+  topology.py       影响闭包纯函数引擎：active/结构上溯传播、检查类型推导、传播边解释、环/超大校验
+  impact_seed.py    影响闭包演示拓扑（跨时钟/契约/策略强制/成环反例素材）
+  impact.py         版本化拓扑、变更单、快照幂等/并发单当前版本、人工排除、冻结门禁、双侧审计
+  api.py      stdlib HTTP REST 路由（ECO + 租约 + 影响闭包三组 API）
   demo.py     四场景端到端演示
 web/
   index.html  签核工作台（代理配置、ECO 队列、门禁矩阵、签核、差异包、拒收留痕）
@@ -112,6 +143,8 @@ web/
   ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
   envelopes.html 设计签名发布信封页面（谱系、签名状态、校验结果、审计）
   envelopes.js   零依赖 JS；支持浏览器 Ed25519 签名与信封/发布查询
+  impact.html    电路影响闭包操作页（拓扑版本/必复验模块/每条传播边解释/排除/门禁/审计）
+  impact.js      闭包重算、人工排除（理由）、强制冲突与可操作错误渲染
 tests/
   test_service.py     24 个领域不变量测试
   test_delegation.py  18 个临时代理签核测试
@@ -119,6 +152,7 @@ tests/
   test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
   test_envelope.py       9 个发布信封领域不变量（并发同内容、续传、撤权、签名者/根密钥轮换、篡改、恢复/同名冲突）
   test_envelope_api.py   2 个真实 HTTP 端到端测试（双签发布离线验真、分块续传页面）
+  test_impact.py        36 个影响闭包测试（传播/结构上溯/强制节点/边解释/环/缺失/超大/幂等/并发单当前/排除/门禁/审计/ECO 联动）
 ```
 
 ## ECO 状态机
@@ -146,6 +180,10 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
   `POST /api/leases/runs/{run_id}/renew|complete|takeover|release` ·
   `GET  /api/leases/board|audit|runs/{run_id}`（操作页 `/ops`）
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`
+- 电路影响闭包：`POST /api/impact/topologies` · `POST /api/impact/changes` ·
+  `.../changes/{id}/compute|edit|exclude|unexclude|ready` ·
+  `GET .../snapshots/{id}|/audit|/topologies|/catalog` ·
+  `POST /api/ecos/{id}/freeze` 支持 `change_id` 走闭包门禁
 - 临时代理签核（管理员）：`POST /api/admin/delegations` ·
   `POST /api/admin/delegations/{id}/revoke` · `GET /api/current-signers`
 - `GET  /api/workbench` · `GET /api/baselines/diff?from=&to=` · `.../diff.zip`

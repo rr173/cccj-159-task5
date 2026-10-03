@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 from .service import ECOError, ECOService
 from .store import Store
 from .leases import LeaseError, LeaseService
+from .impact import ImpactError, ImpactService
+from .impact_seed import seed_demo_topology
+from .topology import ClosureError
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -22,8 +25,10 @@ _MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; ch
          ".css": "text/css; charset=utf-8", ".json": "application/json"}
 
 
-def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
+def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None,
+                  impact_svc: ImpactService | None = None):
     lease_svc = lease_svc or LeaseService(svc.s, svc)
+    impact_svc = impact_svc or ImpactService(svc.s, svc)
     class Handler(BaseHTTPRequestHandler):
         server_version = "ChipECO/1.0"
 
@@ -85,6 +90,8 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
                     return self._static("index.html")
                 if path == "/ops":
                     return self._static("ops.html")
+                if path == "/impact":
+                    return self._static("impact.html")
                 if path.startswith("/static/"):
                     return self._static(path[len("/static/"):])
                 # 更具体的字面路径先于参数化模式匹配
@@ -138,8 +145,29 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
                 m = re.fullmatch(r"/api/leases/runs/(.+)", path)
                 if m:
                     return self._send(200, lease_svc.lease(m.group(1)))
+                # ---- 电路影响闭包 ----
+                if path == "/api/impact/catalog":
+                    return self._send(200, impact_svc.check_catalog())
+                if path == "/api/impact/topologies":
+                    return self._send(200, {"topologies": impact_svc.list_topologies(
+                        self._q("topology_id", "main"))})
+                m = re.fullmatch(r"/api/impact/topologies/(\d+)", path)
+                if m:
+                    return self._send(200, impact_svc.get_topology(int(m.group(1))))
+                if path == "/api/impact/changes":
+                    return self._send(200, {"changes": impact_svc.list_changes()})
+                if path == "/api/impact/audit":
+                    return self._send(200, impact_svc.audit(
+                        cid=self._q("change_id"), action=self._q("action"),
+                        limit=self._q("limit", 200, int)))
+                m = re.fullmatch(r"/api/impact/snapshots/([^/]+)", path)
+                if m:
+                    return self._send(200, impact_svc.get_snapshot(m.group(1)))
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)", path)
+                if m:
+                    return self._send(200, impact_svc.get_change(m.group(1)))
                 self._send(404, {"error": "NOT_FOUND", "message": path})
-            except (ECOError, LeaseError) as e:
+            except (ECOError, LeaseError, ImpactError, ClosureError) as e:
                 self._err(e)
 
         def do_POST(self):
@@ -148,7 +176,9 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
                 b = self._body()
                 if path == "/api/admin/reset":
                     svc.s.reset()
-                    return self._send(200, {"ok": True, "seed": True})
+                    seeded = impact_svc_seed(ImpactService(svc.s, svc))
+                    return self._send(200, {"ok": True, "seed": True,
+                                            "impact_topology_version": seeded})
                 if path == "/api/ecos":
                     d = svc.create_eco(b["title"], b.get("owner", b.get("by", "?")),
                                        b["affected_modules"], b.get("edits"))
@@ -159,7 +189,8 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
                         m.group(1), b["edits"], b.get("by", "?")))
                 m = re.fullmatch(r"/api/ecos/([^/]+)/freeze", path)
                 if m:
-                    return self._send(200, svc.freeze_eco(m.group(1), b.get("by", "?")))
+                    return self._send(200, svc.freeze_eco(
+                        m.group(1), b.get("by", "?"), b.get("change_id")))
                 m = re.fullmatch(r"/api/ecos/([^/]+)/abort", path)
                 if m:
                     return self._send(200, svc.abort_eco(m.group(1), b.get("by", "?")))
@@ -235,26 +266,75 @@ def _make_handler(svc: ECOService, lease_svc: LeaseService | None = None):
                     return self._send(200, lease_svc.release(
                         m.group(1), self._gen(b), b.get("lease_token"),
                         b.get("runner_id", ""), b.get("note", "")))
+                # ---- 电路影响闭包 ----
+                if path == "/api/impact/topologies":
+                    d = impact_svc.upload_topology(
+                        b.get("topology", b), b.get("by", "?"), b.get("note", ""),
+                        b.get("topology_id", "main"))
+                    return self._send(200 if d.get("reused") else 201, d)
+                if path == "/api/impact/changes":
+                    d = impact_svc.create_change(
+                        b["title"], b.get("owner", b.get("by", "?")), b["origins"],
+                        b.get("summary"), b.get("topology_version"),
+                        b.get("max_nodes"))
+                    return self._send(201, d)
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)/compute", path)
+                if m:
+                    return self._send(200, impact_svc.compute(
+                        m.group(1), b.get("by", "?"), b.get("max_nodes"),
+                        chase_latest=not b.get("keep_version", False),
+                        topology_version=b.get("topology_version")))
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)/edit", path)
+                if m:
+                    return self._send(200, impact_svc.update_change(
+                        m.group(1), origins=b.get("origins"), summary=b.get("summary"),
+                        title=b.get("title"), by=b.get("by", "?")))
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)/exclude", path)
+                if m:
+                    return self._send(200, impact_svc.exclude_node(
+                        m.group(1), b["node_id"], b.get("reason", ""),
+                        b.get("by", "?")))
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)/unexclude", path)
+                if m:
+                    return self._send(200, impact_svc.unexclude_node(
+                        m.group(1), b["node_id"], b.get("by", "?")))
+                m = re.fullmatch(r"/api/impact/changes/([^/]+)/ready", path)
+                if m:
+                    return self._send(200, impact_svc.freeze_gate(
+                        m.group(1), b.get("by", "?")))
                 self._send(404, {"error": "NOT_FOUND", "message": path})
             except KeyError as e:
                 self._err(ECOError("BAD_REQUEST", f"缺少字段: {e}", 400))
-            except (ECOError, LeaseError) as e:
+            except (ECOError, LeaseError, ImpactError, ClosureError) as e:
                 self._err(e)
 
     return Handler
+
+
+def impact_svc_seed(impact_svc: ImpactService) -> int | None:
+    """空库时灌入演示用版本化拓扑（有跨时钟、接口契约、策略强制与成环反例素材）。"""
+    if impact_svc.list_topologies():
+        return None
+    d = impact_svc.upload_topology(seed_demo_topology(), by="system",
+                                   note="种子拓扑：SoC 子系统 v1")
+    return d["version"]
 
 
 def serve(db_path=":memory:", port=8080, lease_ttl_seconds=600):
     store = Store(db_path)
     svc = ECOService(store)
     lease_svc = LeaseService(store, svc, ttl_seconds=lease_ttl_seconds)
+    impact_svc = ImpactService(store, svc)
+    impact_svc_seed(impact_svc)
     # 进程启动：恢复未过期租约，回收已过期租约（落盘租约跨重启存活）
     rec = lease_svc.recover()
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), _make_handler(svc, lease_svc))
+    httpd = ThreadingHTTPServer(("0.0.0.0", port),
+                                _make_handler(svc, lease_svc, impact_svc))
     print(f"ECO 基线服务已启动: http://localhost:{port}  (db={db_path})")
     print(f"租约协调: 恢复未过期 {rec['restored_held']} 条，回收过期 {len(rec['recovered_expired'])} 条，"
           f"对账 {rec['reconciled']} 条")
     print(f"Runner 操作页: http://localhost:{port}/ops")
+    print(f"影响闭包分析页: http://localhost:{port}/impact")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

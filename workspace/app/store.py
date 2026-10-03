@@ -234,6 +234,84 @@ CREATE TABLE IF NOT EXISTS lease_meta (
     k               TEXT PRIMARY KEY,
     v               TEXT NOT NULL
 );
+
+-- ===== 电路影响闭包（审核前自动复验范围分析）=====
+-- 版本化拓扑：节点（模块实例/时钟域/接口/策略标记）、边（实例化/数据流/跨时钟/
+-- 接口契约/策略）、约束引用整体内容寻址。新版本永不覆盖旧版本，旧快照仍可追溯。
+CREATE TABLE IF NOT EXISTS topology_version (
+    version         INTEGER PRIMARY KEY AUTOINCREMENT,
+    topology_id     TEXT NOT NULL DEFAULT 'main',
+    content_fp      TEXT NOT NULL,             -- 规范化内容 SHA-256（内容寻址）
+    payload_json    TEXT NOT NULL,
+    created_by      TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    note            TEXT,
+    UNIQUE(topology_id, content_fp)
+);
+
+-- 变更单：修改起点 + 变更摘要。摘要/起点被编辑后，旧闭包快照立即失效不得冻结。
+CREATE TABLE IF NOT EXISTS impact_change (
+    id              TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    owner           TEXT NOT NULL,
+    topology_version INTEGER NOT NULL,         -- 创建/最近一次重算所依据的拓扑版本
+    topology_fp     TEXT NOT NULL,
+    origins_json    TEXT NOT NULL,             -- 修改起点模块 id
+    summary_json    TEXT NOT NULL,             -- 变更摘要 {description, edited_files, ...}
+    status          TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN/READY/FROZEN
+    current_snapshot_id TEXT,                  -- 当前闭包快照（并发重算只保留一个）
+    eco_id          TEXT,                      -- 进入审核冻结后关联的 ECO
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- 闭包分析快照：不可变，绑定拓扑版本指纹 + 变更摘要 + 起点 + 闭包结果。
+-- 相同输入返回同一快照（content_fp 唯一）；只有 CURRENT 快照可用于冻结/发布。
+CREATE TABLE IF NOT EXISTS closure_snapshot (
+    id              TEXT PRIMARY KEY,
+    change_id       TEXT NOT NULL,
+    content_fp      TEXT NOT NULL,             -- 输入指纹（决定幂等复用）
+    topology_version INTEGER NOT NULL,
+    topology_fp     TEXT NOT NULL,
+    origins_json    TEXT NOT NULL,
+    summary_json    TEXT NOT NULL,
+    result_json     TEXT NOT NULL,             -- 闭包节点/边/统计
+    state           TEXT NOT NULL DEFAULT 'CURRENT',  -- CURRENT/SUPERSEDED
+    is_current      INTEGER NOT NULL DEFAULT 1,
+    created_by      TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    superseded_at   TEXT,
+    UNIQUE(change_id, content_fp)
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_change ON closure_snapshot(change_id);
+
+-- 人工排除：绑定具体快照。强制节点（跨时钟/接口契约/策略/起点）不可排除，
+-- 必须填写理由；审计同时保留自动结论与人工覆盖。
+CREATE TABLE IF NOT EXISTS closure_exclusion (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     TEXT NOT NULL,
+    change_id       TEXT NOT NULL,
+    node_id         TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    by              TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    reverted_at     TEXT,
+    UNIQUE(snapshot_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exclusion_snapshot ON closure_exclusion(snapshot_id);
+
+-- 影响分析领域审计：compute（自动结论）/exclude/unexclude（人工覆盖）/
+-- gate_denied（冻结门禁拦截）/freeze 等，全部追加写。
+CREATE TABLE IF NOT EXISTS impact_audit (
+    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor           TEXT,
+    action          TEXT NOT NULL,
+    change_id       TEXT,
+    snapshot_id     TEXT,
+    at              TEXT NOT NULL,
+    detail_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_impact_audit_change ON impact_audit(change_id, seq);
 """
 
 
@@ -372,6 +450,10 @@ class Store:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff_delegation",
                       "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
-                      "lease_event", "lease_claim", "check_lease"]:
+                      "lease_event", "lease_claim", "check_lease",
+                      "impact_audit", "closure_exclusion", "closure_snapshot",
+                      "impact_change", "topology_version"]:
                 c.execute(f"DELETE FROM {t}")
+            # AUTOINCREMENT 表的序列不随 DELETE 重置，显式归零使演示数据从 v1/1 开始
+            c.execute("DELETE FROM sqlite_sequence")
         self._seed()
