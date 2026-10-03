@@ -36,6 +36,25 @@
 - **依赖图**：`LAYOUT_DRC` 依赖 `TIMING_STA`+`POWER_ANALYSIS`，前置未 PASS 时保持
   `BLOCKED`，提前提交以 `DEPENDENCY_BLOCKED` 拒收；前置 FAIL 不会解锁下游。
 
+## 审核前电路影响闭包
+
+创建 ECO 时系统根据**版本化拓扑**（模块实例关系、时钟域、约束引用、强制策略）和变更起点
+自动计算影响闭包，操作页为 `/impact`：
+
+- 输出**必须复验的实例/模块集合、检查类型和每条传播边解释**；跨时钟边生成 `CDC_VERIFY`，
+  接口契约边生成 `INTERFACE_CONTRACT_CHECK`，时钟树和约束引用分别生成对应复验项。
+- 快照绑定 `topology_version/topology_fingerprint/change_summary/result_fingerprint`，
+  并写入冻结快照整体指纹；相同输入返回原快照。
+- 设计人员可排除可选候选，但**每个排除项必须填写理由**；变更起点、跨时钟后继、接口契约
+  后继、约束引用节点和策略强制节点不能排除。普通节点若切断强制路径，返回带完整路径的
+  `MANUAL_EXCLUSION_CONFLICT`。
+- 人工排除不原地修改自动结论，而是追加闭包 revision；`impact_latest` 只保留一个当前版本，
+  并发重算由单事务和唯一约束裁决。审计同时保存 `impact.auto` 与 `impact.override`。
+- 关系图发布新版本后，旧闭包标记为拓扑过期，FROZEN ECO 立即转 `REBASE_REQUIRED`、检查作废、
+  签核失效；旧闭包不得冻结或发布。
+- 环、缺失节点、超大闭包、多实例歧义、强制排除和路径冲突均返回原因码、上下文和可执行
+  `action`。
+
 ## 验证执行租约协调（Runner 层）
 
 多 Runner 并发从验证矩阵领取检查时，由独立的租约层（`app/leases.py`）协调执行权，
@@ -75,6 +94,8 @@ python3 -m app.api --db data/eco.db --port 8080 --lease-ttl 600
 open http://localhost:8080
 # Runner 验证执行租约操作页（待领/持有者/剩余时间/接管/审计）
 open http://localhost:8080/ops
+# 电路影响闭包操作页（拓扑版本、传播解释、人工排除、审计）
+open http://localhost:8080/impact
 
 # 启动独立的设计签名封装服务（默认 8090，SQLite + 内容寻址 blob 落盘）
 python3 -m app.envelope_api --db data/envelope.db --port 8090
@@ -86,7 +107,7 @@ python3 -m app.envelope_cli --db data/envelope.db demo
 # 命令行跑完 A/B/C/D 四个异常场景演示（内存库）
 python3 -m app.demo
 
-# 全部测试（84 个：原 ECO/租约/API 73 个 + 签名封装 11 个）
+# 全部测试（98 个：原 ECO/租约/API 73 个 + 签名封装 11 个 + 影响闭包 14 个）
 python3 -m unittest discover -s tests -v
 ```
 
@@ -95,7 +116,8 @@ python3 -m unittest discover -s tests -v
 ```
 app/
   store.py    SQLite schema/连接/种子基线 R0/检查目录(依赖与作用域)/租约与租约审计表
-  service.py  领域核心：冻结指纹、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
+  service.py  领域核心：冻结指纹、影响闭包绑定、依赖调度、排队合并、双签门禁、临时代理签核授权、两阶段发布、差异包
+  impact.py   版本化电路拓扑、影响闭包传播、跨时钟/接口/约束/策略强制节点、人工排除与审计
   leases.py   验证执行租约协调：幂等领取(原子单赢家)、续租、代次+HMAC凭据完成、超时接管、重启恢复
   runner.py   模拟验证 Runner（自行算指纹；可演示迟到/篡改）
   envelope_store.py 签名封装 SQLite schema、内容寻址 blob 与崩溃恢复元数据
@@ -110,12 +132,15 @@ web/
   app.js      零依赖 JS；浏览器端用 WebCrypto 复算 Runner 指纹
   ops.html    Runner 租约操作页（待领任务、持有者与剩余时间、超时接管、接管历史、拒绝审计）
   ops.js      租约领取/续租/完成/释放/接管；token 仅领取时分发，localStorage 保存授权
+  impact.html 电路影响闭包操作页（拓扑版本、闭包候选、传播边解释、人工排除、审计）
+  impact.js   零依赖 JS；发布拓扑、计算闭包、提交带理由排除并展示可操作错误
   envelopes.html 设计签名发布信封页面（谱系、签名状态、校验结果、审计）
   envelopes.js   零依赖 JS；支持浏览器 Ed25519 签名与信封/发布查询
 tests/
   test_service.py     24 个领域不变量测试
   test_delegation.py  18 个临时代理签核测试
   test_leases.py      22 个租约协调不变量测试（并发单赢家/幂等/代次凭据/接管/重跑迟到/重启恢复）
+  test_impact.py      14 个影响闭包测试（传播/强制节点/排除冲突/环/缺节点/超大闭包/动态门禁/并发单当前版本）
   test_api.py          9 个真实 socket HTTP 测试（含租约领取-接管-完成端到端）
   test_envelope.py       9 个发布信封领域不变量（并发同内容、续传、撤权、签名者/根密钥轮换、篡改、恢复/同名冲突）
   test_envelope_api.py   2 个真实 HTTP 端到端测试（双签发布离线验真、分块续传页面）
@@ -146,6 +171,8 @@ DRAFT ──freeze(无锁冲突)──▶ FROZEN ──双签+发布──▶ RE
   `POST /api/leases/runs/{run_id}/renew|complete|takeover|release` ·
   `GET  /api/leases/board|audit|runs/{run_id}`（操作页 `/ops`）
 - `POST /api/ecos/{src}/merge-into/{tgt}` · `POST /api/constraints`
+- 电路影响闭包：`GET/POST /api/impact/topology` · `POST /api/impact/compute` ·
+  `POST /api/impact/snapshots/{id}/exclusions` · `GET /api/impact/audit`（操作页 `/impact`）
 - 临时代理签核（管理员）：`POST /api/admin/delegations` ·
   `POST /api/admin/delegations/{id}/revoke` · `GET /api/current-signers`
 - `GET  /api/workbench` · `GET /api/baselines/diff?from=&to=` · `.../diff.zip`

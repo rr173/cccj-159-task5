@@ -54,7 +54,9 @@ CREATE TABLE IF NOT EXISTS eco (
     snapshot_json   TEXT,
     fingerprint     TEXT,
     freeze_epoch    INTEGER NOT NULL DEFAULT 0,
-    merge_of_json   TEXT
+    merge_of_json   TEXT,
+    impact_snapshot_id TEXT,
+    impact_input_json  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS check_run (
@@ -183,6 +185,75 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail_json     TEXT
 );
 
+-- ===== 版本化电路拓扑与影响闭包 =====
+CREATE TABLE IF NOT EXISTS impact_topology (
+    version         INTEGER PRIMARY KEY,
+    fingerprint     TEXT NOT NULL,
+    graph_json      TEXT NOT NULL,
+    status          TEXT NOT NULL,             -- CURRENT / SUPERSEDED
+    note            TEXT,
+    created_by      TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS impact_current (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    version         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS impact_request (
+    id                  TEXT PRIMARY KEY,       -- scope:input_fp:topology_version
+    scope               TEXT NOT NULL,
+    input_fingerprint   TEXT NOT NULL,
+    topology_version    INTEGER NOT NULL,
+    created_by          TEXT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_impact_request_scope
+ON impact_request(scope,input_fingerprint);
+
+-- 闭包快照不可变。revision=1 为自动结论；人工排除追加新 revision，旧行改 SUPERSEDED。
+CREATE TABLE IF NOT EXISTS impact_snapshot (
+    id                      TEXT PRIMARY KEY,
+    request_id              TEXT NOT NULL,
+    scope                   TEXT NOT NULL,
+    revision                INTEGER NOT NULL,
+    parent_snapshot_id      TEXT,
+    topology_version        INTEGER NOT NULL,
+    topology_fingerprint    TEXT NOT NULL,
+    input_fingerprint       TEXT NOT NULL,
+    exclusion_fingerprint   TEXT NOT NULL,
+    result_fingerprint      TEXT NOT NULL,
+    status                  TEXT NOT NULL,        -- CURRENT / SUPERSEDED / TOPOLOGY_SUPERSEDED
+    result_json             TEXT NOT NULL,
+    created_by              TEXT,
+    created_at              TEXT NOT NULL,
+    UNIQUE(request_id, revision),
+    UNIQUE(request_id, exclusion_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_impact_scope_status
+ON impact_snapshot(scope,input_fingerprint,status);
+
+CREATE TABLE IF NOT EXISTS impact_latest (
+    scope               TEXT NOT NULL,
+    input_fingerprint   TEXT NOT NULL,
+    snapshot_id         TEXT NOT NULL,
+    topology_version    INTEGER NOT NULL,
+    PRIMARY KEY(scope,input_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS impact_override (
+    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id         TEXT NOT NULL,
+    parent_snapshot_id  TEXT NOT NULL,
+    scope               TEXT NOT NULL,
+    node_id             TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    by                  TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_impact_override_snapshot ON impact_override(snapshot_id);
+
 -- ===== 验证执行租约协调（与 ECO 服务配套的租约层）=====
 -- 每个 check_run 至多一条当前租约行（run_id UNIQUE）；gen 为租约代次，
 -- 每次接管 +1，用于拒绝旧持有者的迟到结果/续租。token 以 HMAC 派生（服务密钥
@@ -254,6 +325,10 @@ SEED_MODULES = {
         "netlist": "MODULE noc; CELL ROUTER r0/r1; LINK r0.east=r1.west; ENDMODULE",
         "version": 1,
     },
+    "dbg": {
+        "netlist": "MODULE dbg; CELL DEBUG_APB u_dbg_apb; ENDMODULE",
+        "version": 1,
+    },
 }
 
 SEED_CONSTRAINTS = {
@@ -283,6 +358,16 @@ CHECKS: dict[str, dict] = {
                       "scopes": ["netlist", "modules"]},
     "LINT_INFO":     {"label": "Lint 信息检查(非必需)", "required": False,
                       "depends_on": [],          "scopes": ["netlist", "modules"]},
+    # 以下检查默认不是所有 ECO 必需；当影响闭包生成对应 check_type 时，该 ECO 的 check_run
+    # 会动态标记 required=1，从而进入审核/发布门禁。
+    "CDC_VERIFY":              {"label": "跨时钟域 CDC 复验", "required": False,
+                                "depends_on": [], "scopes": ["netlist", "modules"]},
+    "INTERFACE_CONTRACT_CHECK": {"label": "接口契约复验", "required": False,
+                                 "depends_on": [], "scopes": ["netlist", "modules"]},
+    "CONSTRAINT_REFERENCE_CHECK": {"label": "约束引用复验", "required": False,
+                                   "depends_on": [], "scopes": ["netlist", "sdc", "modules"]},
+    "CLOCK_TREE_REVIEW":       {"label": "时钟树传播复验", "required": False,
+                                "depends_on": [], "scopes": ["netlist", "sdc", "modules"]},
 }
 
 
@@ -316,6 +401,11 @@ class Store:
                 c.execute("ALTER TABLE signoff ADD COLUMN voided_at TEXT")
             if "voided_reason" not in cols:
                 c.execute("ALTER TABLE signoff ADD COLUMN voided_reason TEXT")
+            eco_cols = {r["name"] for r in c.execute("PRAGMA table_info(eco)")}
+            if "impact_snapshot_id" not in eco_cols:
+                c.execute("ALTER TABLE eco ADD COLUMN impact_snapshot_id TEXT")
+            if "impact_input_json" not in eco_cols:
+                c.execute("ALTER TABLE eco ADD COLUMN impact_input_json TEXT")
 
     # ---- 事务辅助 ----
     class _Tx:
@@ -348,6 +438,7 @@ class Store:
 
     # ---- 初始数据 ----
     def _seed(self):
+        self._seed_impact_topology()
         if self.q_one("SELECT 1 FROM baseline WHERE revision = 0"):
             return
         from .service import build_snapshot, snapshot_fingerprint
@@ -367,11 +458,20 @@ class Store:
                 (json.dumps(SEED_CONSTRAINTS, ensure_ascii=False, sort_keys=True),),
             )
 
+    def _seed_impact_topology(self):
+        if self.q_one("SELECT 1 FROM impact_current WHERE id=1"):
+            return
+        from .impact import ImpactService, SEED_TOPOLOGY
+        ImpactService(self).publish_topology(
+            SEED_TOPOLOGY, "system", "初始模块实例关系、时钟域、约束引用与强制策略")
+
     def reset(self):
         with self.tx() as c:
             for t in ["audit_log", "rejected_result", "release_journal", "release",
                       "adjudication", "queue_entry", "module_lock", "signoff_delegation",
                       "signoff", "check_run", "eco", "constraint_event", "trunk", "baseline",
-                      "lease_event", "lease_claim", "check_lease"]:
+                      "lease_event", "lease_claim", "check_lease", "impact_override",
+                      "impact_latest", "impact_snapshot", "impact_request",
+                      "impact_current", "impact_topology"]:
                 c.execute(f"DELETE FROM {t}")
         self._seed()

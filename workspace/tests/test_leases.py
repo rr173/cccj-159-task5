@@ -115,20 +115,28 @@ class TestClaim(unittest.TestCase):
     def test_auto_pick_skips_held_and_picks_ready_only(self):
         _, svc, leases, _ = fresh()
         eid = make_frozen(svc)
-        g1 = leases.claim("runner-a")           # 自动挑选按 (eco,check) 字典序
-        self.assertEqual(g1["check_type"], "FORMAL_EQUIV")
+        g1 = leases.claim("runner-a")           # 影响闭包使 CDC/接口/约束引用成为必需检查
+        self.assertEqual(g1["check_type"], "CDC_VERIFY")
         g2 = leases.claim("runner-b")
-        self.assertEqual(g2["check_type"], "LINT_INFO")
+        self.assertEqual(g2["check_type"], "CLOCK_TREE_REVIEW")
         g3 = leases.claim("runner-c")
-        self.assertEqual(g3["check_type"], "POWER_ANALYSIS")
+        self.assertEqual(g3["check_type"], "CONSTRAINT_REFERENCE_CHECK")
         g4 = leases.claim("runner-d")
-        self.assertEqual(g4["check_type"], "TIMING_STA")
+        self.assertEqual(g4["check_type"], "FORMAL_EQUIV")
+        g5 = leases.claim("runner-e")
+        self.assertEqual(g5["check_type"], "INTERFACE_CONTRACT_CHECK")
+        g6 = leases.claim("runner-f")
+        self.assertEqual(g6["check_type"], "LINT_INFO")
+        g7 = leases.claim("runner-g")
+        self.assertEqual(g7["check_type"], "POWER_ANALYSIS")
+        g8 = leases.claim("runner-h")
+        self.assertEqual(g8["check_type"], "TIMING_STA")
         with self.assertRaises(LeaseError) as cm:
-            leases.claim("runner-e")            # LAYOUT_DRC 依赖未满足，不会被挑
+            leases.claim("runner-i")            # LAYOUT_DRC 依赖未满足，不会被挑
         self.assertEqual(cm.exception.code, "NO_CLAIMABLE_TASK")
         drc = current_run_id(svc, eid, "LAYOUT_DRC")
         with self.assertRaises(LeaseError) as cm:
-            leases.claim("runner-e", run_id=drc)
+            leases.claim("runner-j", run_id=drc)
         self.assertEqual(cm.exception.code, "DEPENDENCY_NOT_READY")
 
     def test_second_runner_blocked_until_expiry(self):

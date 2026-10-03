@@ -66,8 +66,9 @@ def matrix_catalog():
     ]
 
 
-def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: str = ""):
-    """构造不可变冻结快照：网表 + 约束 + 受影响模块 + 验证矩阵。"""
+def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: str = "",
+                   impact: dict | None = None):
+    """构造不可变冻结快照：网表 + 约束 + 受影响模块 + 验证矩阵 + 影响闭包。"""
     return {
         "schema": "chip-eco-baseline/1",
         "note": note,
@@ -76,6 +77,7 @@ def build_snapshot(modules: dict, constraints: dict, affected: list[str], note: 
         "constraints": constraints,
         "modules": copy.deepcopy(modules),
         "verification_matrix": matrix_catalog(),
+        "impact_closure": copy.deepcopy(impact) if impact is not None else None,
     }
 
 
@@ -85,6 +87,7 @@ def snapshot_fingerprint(snap: dict) -> str:
         "constraints": snap["constraints"],
         "modules": snap["modules"],
         "verification_matrix": snap["verification_matrix"],
+        "impact_closure": snap.get("impact_closure"),
     })
 
 
@@ -113,7 +116,8 @@ def _baseline_dict(row):
 
 def _eco_dict(row):
     d = dict(row)
-    for k in ("affected_modules_json", "edits_json", "snapshot_json", "merge_of_json"):
+    for k in ("affected_modules_json", "edits_json", "snapshot_json", "merge_of_json",
+              "impact_input_json"):
         d[k.removesuffix("_json")] = json.loads(d.pop(k)) if d[k] is not None else None
     return d# ---------------------------------------------------------------- 服务
 
@@ -194,8 +198,13 @@ class ECOService:
         return {"checks": matrix_catalog()}
 
     # ===== ECO 生命周期 =====
+    def _impact_svc(self):
+        from .impact import ImpactService
+        return ImpactService(self.s)
+
     def create_eco(self, title: str, owner: str, affected_modules: list[str],
-                   edits: dict | None = None) -> dict:
+                   edits: dict | None = None, root_instances: list[str] | None = None,
+                   change_summary: dict | None = None, compute_impact: bool = True) -> dict:
         if not title or not owner:
             raise ECOError("BAD_REQUEST", "title/owner 必填", 400)
         with self.s.tx() as c:
@@ -212,15 +221,39 @@ class ECOService:
             for m, e in edits.items():
                 if not isinstance(e, dict) or not isinstance(e.get("netlist"), str):
                     raise ECOError("BAD_EDIT", f"模块 {m} 的编辑必须形如 {{'netlist': '...'}}", 400)
+            impact_svc = self._impact_svc()
+            roots, topo = impact_svc.resolve_roots_for_modules(
+                c, affected_modules, root_instances)
+            summary = change_summary or {
+                "title": title,
+                "owner": owner,
+                "modules": sorted(affected_modules),
+                "edited_modules": sorted(edits),
+                "edit_fingerprints": {m: fp_json(e.get("netlist", ""))
+                                      for m, e in sorted(edits.items())},
+            }
+            impact_input = {"scope": None, "roots": roots,
+                            "change_summary": summary, "by": owner}
             n = c.execute("SELECT COUNT(*) k FROM eco").fetchone()["k"]
             eco_id = f"ECO-{n + 1:03d}"
+            impact_snap_id = None
+            impact_input["scope"] = f"eco:{eco_id}"
+            if compute_impact:
+                snap = impact_svc.compute(
+                    impact_input["scope"], roots, summary, owner, c=c)
+                impact_snap_id = snap["id"]
             c.execute(
-                "INSERT INTO eco(id,title,owner,status,affected_modules_json,edits_json,created_at)"
-                " VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO eco(id,title,owner,status,affected_modules_json,edits_json,"
+                "created_at,impact_snapshot_id,impact_input_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (eco_id, title, owner, "DRAFT",
                  json.dumps(sorted(affected_modules)), json.dumps(edits, ensure_ascii=False),
-                 utcnow()))
-            self._audit(c, "eco.create", eco_id, owner, {"title": title})
+                 utcnow(), impact_snap_id,
+                 json.dumps(impact_input, ensure_ascii=False)))
+            self._audit(c, "eco.create", eco_id, owner,
+                        {"title": title, "roots": roots,
+                         "topology_version": topo["version"],
+                         "impact_snapshot_id": impact_snap_id})
             return self.eco_detail(eco_id, c)
 
     def update_edits(self, eco_id, edits: dict, by: str):
@@ -234,9 +267,23 @@ class ECOService:
             if bad:
                 raise ECOError("EDIT_OUT_OF_SCOPE", f"模块超出受影响范围: {bad}", 400)
             merged = {**json.loads(eco["edits_json"]), **edits}
-            c.execute("UPDATE eco SET edits_json=? WHERE id=?",
-                      (json.dumps(merged, ensure_ascii=False), eco_id))
-            self._audit(c, "eco.edit", eco_id, by, {"keys": sorted(edits)})
+            impact_input = json.loads(eco["impact_input_json"]) if eco["impact_input_json"] else None
+            impact_id = eco["impact_snapshot_id"]
+            if impact_input:
+                impact_input["change_summary"]["edits"] = merged
+                impact_input["change_summary"]["edited_modules"] = sorted(merged)
+                impact_input["change_summary"]["edit_fingerprints"] = {
+                    m: fp_json(e.get("netlist", "")) for m, e in sorted(merged.items())}
+                impact_id = self._impact_svc().compute(
+                    impact_input["scope"], impact_input["roots"],
+                    impact_input["change_summary"], by, c=c)["id"]
+            c.execute("UPDATE eco SET edits_json=?,impact_snapshot_id=?,impact_input_json=? "
+                      "WHERE id=?",
+                      (json.dumps(merged, ensure_ascii=False), impact_id,
+                       json.dumps(impact_input, ensure_ascii=False) if impact_input else None,
+                       eco_id))
+            self._audit(c, "eco.edit", eco_id, by,
+                        {"keys": sorted(edits), "impact_snapshot_id": impact_id})
             return self.eco_detail(eco_id, c)
 
     def _effective_modules(self, base_modules: dict, affected, edits):
@@ -255,7 +302,15 @@ class ECOService:
         """
         snap = json.loads(eco["snapshot_json"])
         epoch = eco["freeze_epoch"]
+        dynamic_impact_checks = {"CDC_VERIFY", "INTERFACE_CONTRACT_CHECK",
+                                 "CONSTRAINT_REFERENCE_CHECK", "CLOCK_TREE_REVIEW"}
+        required_impact_checks = {
+            x["check_type"] for x in
+            (snap.get("impact_closure") or {}).get("check_types", [])
+            if x.get("check_type") in dynamic_impact_checks
+        }
         for t, spec in CHECKS.items():
+            required = bool(spec["required"] or t in required_impact_checks)
             attempt = c.execute(
                 "SELECT COALESCE(MAX(attempt),0)+1 a FROM check_run WHERE eco_id=? AND check_type=?",
                 (eco["id"], t)).fetchone()["a"]
@@ -264,7 +319,7 @@ class ECOService:
                 "depends_on_json,expected_fp) VALUES(?,?,?,?,?,?,?,?)",
                 (f"{eco['id']}:{t}:e{epoch}:a{attempt}", eco["id"], t, attempt,
                  "PENDING" if not spec["depends_on"] else "BLOCKED",
-                 int(spec["required"]), json.dumps(spec["depends_on"]),
+                 int(required), json.dumps(spec["depends_on"]),
                  scope_fingerprint(snap, spec["scopes"])))
 
     def _supersede_runs(self, c, eco_id, reason: str):
@@ -304,6 +359,22 @@ class ECOService:
             if eco["status"] not in ("DRAFT", "REBASE_REQUIRED"):
                 raise ECOError("NOT_FREEZABLE",
                                f"状态 {eco['status']} 不可冻结", 409)
+            impact_svc = self._impact_svc()
+            impact_snap = impact_svc.assert_snapshot_usable(c, eco["impact_snapshot_id"])
+            impact_payload = {
+                "snapshot_id": impact_snap["id"],
+                "request_id": impact_snap["request_id"],
+                "topology_version": impact_snap["topology_version"],
+                "topology_fingerprint": impact_snap["topology_fingerprint"],
+                "result_fingerprint": impact_snap["result_fingerprint"],
+                "change_summary": impact_snap["result"]["change_summary"],
+                "roots": impact_snap["result"]["roots"],
+                "accepted_nodes": impact_snap["result"]["accepted_nodes"],
+                "accepted_modules": impact_snap["result"]["accepted_modules"],
+                "check_types": impact_snap["result"]["check_types"],
+                "propagation_edges": impact_snap["result"]["propagation_edges"],
+                "exclusions": impact_snap["result"]["exclusions"],
+            }
             modules = json.loads(eco["affected_modules_json"])
             edits = json.loads(eco["edits_json"])
             conflicts = self._lock_conflicts(c, modules, exclude_eco=eco_id)
@@ -327,7 +398,8 @@ class ECOService:
             constraints = json.loads(trunk["working_constraints_json"])
             eff_mods = self._effective_modules(base_snap["modules"], modules, edits)
             snap = build_snapshot(eff_mods, constraints, modules,
-                                 note=f"{eco_id} 冻结于 {trunk['base_id']}")
+                                 note=f"{eco_id} 冻结于 {trunk['base_id']}",
+                                 impact=impact_payload)
             fp = snapshot_fingerprint(snap)
             epoch = eco["freeze_epoch"] + 1
             c.execute(
@@ -493,6 +565,12 @@ class ECOService:
             c.execute("UPDATE check_run SET status='SUPERSEDED' WHERE id=?", (run["id"],))
             snap = json.loads(eco["snapshot_json"])
             spec = CHECKS[check_type]
+            impact_required = check_type in {"CDC_VERIFY", "INTERFACE_CONTRACT_CHECK",
+                                             "CONSTRAINT_REFERENCE_CHECK",
+                                             "CLOCK_TREE_REVIEW"} and any(
+                x["check_type"] == check_type
+                for x in (snap.get("impact_closure") or {}).get("check_types", []))
+            required = bool(spec["required"] or impact_required)
             deps = json.loads(run["depends_on_json"])
             active = {r["check_type"]: r for r in self._active_runs(c, eco_id)}
             unblocked = all(active.get(d) and active[d]["status"] == "PASS" for d in deps) if deps else True
@@ -500,7 +578,7 @@ class ECOService:
                 "INSERT INTO check_run(id,eco_id,check_type,attempt,status,required,"
                 "depends_on_json,expected_fp) VALUES(?,?,?,?,?,?,?,?)",
                 (f"{eco_id}:{check_type}:e{eco['freeze_epoch']}:a{attempt}", eco_id, check_type, attempt,
-                 "PENDING" if unblocked else "BLOCKED", int(spec["required"]),
+                 "PENDING" if unblocked else "BLOCKED", int(required),
                  json.dumps(deps), scope_fingerprint(snap, spec["scopes"])))
             self._audit(c, "check.rerun", f"{eco_id}:{check_type}", by, {"attempt": attempt})
             return self.eco_detail(eco_id, c)
@@ -669,15 +747,17 @@ class ECOService:
         for t, spec in CHECKS.items():
             r = next((x for x in runs if x["check_type"] == t), None)
             status = r["status"] if r else "MISSING"
+            required_for_eco = bool(r["required"]) if r else bool(spec["required"])
             fp_ok = bool(r and r["result_fp"] and r["result_fp"] == r["expected_fp"])
             satisfied = status == "PASS" and fp_ok
-            if spec["required"] and not satisfied:
+            if required_for_eco and not satisfied:
                 required_pass = False
             deps = json.loads(r["depends_on_json"]) if r else []
             dep_status = {d: next((x["status"] for x in runs if x["check_type"] == d), "MISSING")
                           for d in deps}
             checks_out.append({
-                "type": t, "label": spec["label"], "required": spec["required"],
+                "type": t, "label": spec["label"], "required": required_for_eco,
+                "catalog_required": spec["required"],
                 "status": status, "fingerprint_ok": fp_ok, "satisfied": satisfied,
                 "depends_on": deps, "dep_status": dep_status,
                 "submitted_at": r["submitted_at"] if r else None,
@@ -911,6 +991,35 @@ class ECOService:
                 else:
                     merged_edits[m] = e
             merged_modules = sorted(tgt_mods | src_mods)
+            tgt_impact_in = json.loads(tgt["impact_input_json"]) if tgt["impact_input_json"] else {}
+            src_impact_in = json.loads(src["impact_input_json"]) if src["impact_input_json"] else {}
+            merged_roots = sorted(set(tgt_impact_in.get("roots", []))
+                                  | set(src_impact_in.get("roots", [])))
+            merged_summary = {
+                "title": f"MERGE {source_eco_id} into {target_eco_id}",
+                "modules": merged_modules,
+                "edited_modules": sorted(merged_edits),
+                "source_eco": source_eco_id,
+                "target_eco": target_eco_id,
+                "module_winners": module_winners,
+                "roots": merged_roots,
+            }
+            impact_snap = self._impact_svc().compute(
+                f"eco:{target_eco_id}", merged_roots, merged_summary, by, c=c)
+            impact_payload = {
+                "snapshot_id": impact_snap["id"],
+                "request_id": impact_snap["request_id"],
+                "topology_version": impact_snap["topology_version"],
+                "topology_fingerprint": impact_snap["topology_fingerprint"],
+                "result_fingerprint": impact_snap["result_fingerprint"],
+                "change_summary": merged_summary,
+                "roots": merged_roots,
+                "accepted_nodes": impact_snap["result"]["accepted_nodes"],
+                "accepted_modules": impact_snap["result"]["accepted_modules"],
+                "check_types": impact_snap["result"]["check_types"],
+                "propagation_edges": impact_snap["result"]["propagation_edges"],
+                "exclusions": impact_snap["result"]["exclusions"],
+            }
 
             # 在 target 的冻结基线之上重建快照（保持同一父基线与约束版本）
             parent = c.execute("SELECT * FROM baseline WHERE id=?",
@@ -919,14 +1028,19 @@ class ECOService:
             constraints = json.loads(tgt["snapshot_json"])["constraints"]
             eff = self._effective_modules(base_snap["modules"], merged_modules, merged_edits)
             snap = build_snapshot(eff, constraints, merged_modules,
-                                 note=f"{target_eco_id} 合并 {source_eco_id} 后重新冻结")
+                                 note=f"{target_eco_id} 合并 {source_eco_id} 后重新冻结",
+                                 impact=impact_payload)
             fp = snapshot_fingerprint(snap)
             epoch = tgt["freeze_epoch"] + 1
+            merged_input = {"scope": f"eco:{target_eco_id}", "roots": merged_roots,
+                            "change_summary": merged_summary, "by": by}
             c.execute(
                 "UPDATE eco SET affected_modules_json=?,edits_json=?,snapshot_json=?,"
-                "fingerprint=?,freeze_epoch=? WHERE id=?",
+                "fingerprint=?,freeze_epoch=?,impact_snapshot_id=?,impact_input_json=? "
+                "WHERE id=?",
                 (json.dumps(merged_modules), json.dumps(merged_edits, ensure_ascii=False),
-                 json.dumps(snap, ensure_ascii=False), fp, epoch, target_eco_id))
+                 json.dumps(snap, ensure_ascii=False), fp, epoch, impact_snap["id"],
+                 json.dumps(merged_input, ensure_ascii=False), target_eco_id))
             self._supersede_runs(c, target_eco_id, "merge")
             self._void_signoffs(c, target_eco_id, "merge adjudication: scope expanded")
             for m in added:
@@ -966,11 +1080,12 @@ class ECOService:
                                "发布处于中断态，请调用 resume 完成或恢复", 409)
             if eco["status"] != "FROZEN":
                 raise ECOError("NOT_FROZEN", f"状态 {eco['status']} 不可发布", 409)
+            self._impact_svc().assert_snapshot_usable(c, eco["impact_snapshot_id"])
             g = self.gate(eco, c)
             if not g["releasable"]:
                 raise ECOError("NOT_RELEASABLE",
-                               "门禁未全绿或双角色签核不全，拒绝发布", 409,
-                               {"green": g["green"], "dual": g["dual_role_complete"]})
+                              "门禁未全绿或双角色签核不全，拒绝发布", 409,
+                              {"green": g["green"], "dual": g["dual_role_complete"]})
             c.execute("UPDATE eco SET status='RELEASING' WHERE id=?", (eco_id,))
             c.execute(
                 "INSERT INTO release(eco_id,state,started_at,failpoint) VALUES(?,?,?,?)",
@@ -999,6 +1114,7 @@ class ECOService:
             if eco["status"] != "RELEASING":
                 raise ECOError("BAD_STATE", f"ECO 状态 {eco['status']} 异常", 409)
             # 恢复时重新验证：中断期间不允许任何变更（约束更新/中止均被拒绝），这里是纵深防御
+            self._impact_svc().assert_snapshot_usable(c, eco["impact_snapshot_id"])
             g = self.gate(eco, c)
             if not g["releasable"]:
                 raise ECOError("NOT_RELEASABLE", "恢复时校验失败，基线不再满足发布条件", 409)
@@ -1062,11 +1178,39 @@ class ECOService:
                 (eco_id,)).fetchall()]
             rel = conn.execute("SELECT * FROM release WHERE eco_id=?", (eco_id,)).fetchone()
             d["release"] = dict(rel) if rel else None
+            impact_row = conn.execute("SELECT * FROM impact_snapshot WHERE id=?",
+                                      (eco["impact_snapshot_id"],)).fetchone()
+            if impact_row:
+                d["impact"] = self._impact_svc()._snapshot_dict(impact_row, conn)
+            else:
+                d["impact"] = None
             return d
         if c is not None:
             return q(c)
         with self.s.lock:
             return q(self.s.conn)
+
+    def eco_impact_summary(self, snapshot_id: str | None):
+        if not snapshot_id:
+            return None
+        row = self.s.q_one("SELECT * FROM impact_snapshot WHERE id=?", (snapshot_id,))
+        if not row:
+            return None
+        d = self._impact_svc()._snapshot_dict(row, self.s.conn)
+        return {
+            "snapshot_id": d["id"], "revision": d["revision"],
+            "topology_version": d["topology_version"],
+            "topology_fingerprint": d["topology_fingerprint"],
+            "result_fingerprint": d["result_fingerprint"],
+            "usable_for_review": d["usable_for_review"],
+            "current": d["current"], "topology_current": d["topology_current"],
+            "roots": d["result"]["roots"],
+            "accepted_nodes": d["result"]["accepted_nodes"],
+            "accepted_modules": d["result"]["accepted_modules"],
+            "excluded_nodes": d["result"]["excluded_nodes"],
+            "check_types": [x["check_type"] for x in d["result"]["check_types"]],
+            "counts": d["result"]["counts"],
+        }
 
     def list_ecos(self):
         with self.s.lock:
@@ -1081,6 +1225,7 @@ class ECOService:
                 d["required_all_pass"] = g["required_all_pass"]
                 d["dual_role_complete"] = g["dual_role_complete"]
                 d["check_summary"] = {x["type"]: x["status"] for x in g["checks"]}
+                d["impact"] = self.eco_impact_summary(r["impact_snapshot_id"])
                 out.append(d)
             return out
 

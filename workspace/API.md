@@ -18,6 +18,31 @@
   - `ECO_NOT_ACTIVE` ECO 不在 FROZEN 态
   - `BASE_CONSTRAINT_CHANGED` 基础约束更新导致在验单整体作废（系统事件留痕）
 
+### 电路影响闭包（审核前自动复验分析）
+
+影响闭包基于**版本化电路拓扑**（模块实例、传播边、时钟域、约束引用、强制策略）和
+变更起点计算，输出必须复验的实例/模块集合、检查类型与每条传播边解释。
+
+- 拓扑版本：`version/fingerprint/status`，相同拓扑内容重复发布幂等；新版本会冻结旧闭包，
+  并把已 FROZEN ECO 转为 `REBASE_REQUIRED`，旧检查 SUPERSEDED、旧签核失效。
+- 闭包快照：`revision=1` 是自动结论；人工排除必须填写理由并追加 `revision=n`，旧快照保留为
+  `SUPERSEDED`。相同 `(scope, roots, change_summary, topology_version)` 重放返回原快照。
+- 当前指针：`impact_latest(scope,input_fingerprint)` 只指向一个当前快照；并发重算/覆盖
+  由唯一约束和 `BEGIN IMMEDIATE` 保证至多一个当前版本。
+- **不可排除节点**：变更起点、跨时钟边后继、接口契约边后继、约束引用节点、策略强制节点。
+  排除普通节点若导致强制节点路径被切断，返回 `MANUAL_EXCLUSION_CONFLICT`。
+- 可操作错误：
+  - `TOPOLOGY_CYCLE_DETECTED`：返回 `cycle` 与断环建议。
+  - `TOPOLOGY_MISSING_NODE` / `CHANGE_ROOT_NOT_FOUND`：返回缺失节点和修正动作。
+  - `IMPACT_CLOSURE_TOO_LARGE`：返回闭包大小/上限和拆分建议。
+  - `MANDATORY_EXCLUSION_FORBIDDEN`：返回强制原因。
+  - `MANUAL_EXCLUSION_CONFLICT`：返回被切断的强制节点、完整路径和阻断排除项。
+  - `EXCLUSION_REASON_REQUIRED` / `AMBIGUOUS_MODULE_INSTANCE`。
+  - `IMPACT_REQUIRED` / `IMPACT_SNAPSHOT_STALE` / `IMPACT_SNAPSHOT_NOT_CURRENT`：
+    旧闭包不能冻结或发布。
+- 冻结快照 `snapshot.impact_closure` 包含闭包 ID、拓扑版本/指纹、变更摘要、复验集合、
+  检查类型、边解释和排除记录；整体进入 ECO 快照指纹。
+
 ### 验证执行租约（Runner 协调层）
 
 与 ECO 服务配套的租约层负责“谁在哪一代次可以提交哪个检查”，**不改变** ECO 侧门禁：
@@ -85,11 +110,24 @@
 ### ECO
 | 方法 | 路径 | Body / 说明 |
 |---|---|---|
-| POST | `/api/ecos` | `{title, owner, affected_modules[], edits:{m:{netlist}}}` → 201 |
-| POST | `/api/ecos/{id}/edits` | `{edits, by}` 仅 DRAFT/REBASE_REQUIRED |
-| POST | `/api/ecos/{id}/freeze` | `{by}` 冲突时转 QUEUED，否则冻结+触发矩阵 |
+| POST | `/api/ecos` | `{title, owner, affected_modules[], edits, root_instances?, change_summary?, compute_impact?}` → 201；默认创建时自动计算影响闭包 |
+| POST | `/api/ecos/{id}/edits` | `{edits, by}` 仅 DRAFT/REBASE_REQUIRED；编辑内容变化会重算当前闭包 |
+| POST | `/api/ecos/{id}/freeze` | `{by}` 先校验影响闭包仍为当前版本；冲突时转 QUEUED，否则冻结+触发矩阵 |
 | POST | `/api/ecos/{id}/abort` | `{by}` 释放锁并推动排队单晋升 |
-| GET | `/api/ecos` / `/api/ecos/{id}` | 列表（含门禁摘要）/ 详情（含 gate/queue/release）|
+| GET | `/api/ecos` / `/api/ecos/{id}` | 列表（含门禁/闭包摘要）/ 详情（含 gate/queue/release/impact）|
+| GET | `/api/ecos/{id}/impact` | ECO 绑定的影响闭包快照（候选、边解释、人工排除）|
+
+### 电路影响闭包
+| 方法 | 路径 | Body / 说明 |
+|---|---|---|
+| GET | `/api/impact/topology` | 当前版本化拓扑（nodes/edges/clock_domains/constraint_refs/policies）|
+| GET | `/api/impact/topologies` | 拓扑版本列表 |
+| POST | `/api/impact/topology` | `{graph, by, note}`；校验环/缺失节点/重复节点后发布新版本 |
+| POST | `/api/impact/compute` | `{scope, roots[], change_summary, by}`；相同输入返回原快照 |
+| GET | `/api/impact/snapshots/{id}` | 不可变闭包详情；`usable_for_review` 表示可冻结/发布 |
+| POST | `/api/impact/snapshots/{id}/exclusions` | `{by, exclusions:[{node, reason}]}`；追加人工覆盖版本 |
+| GET | `/api/impact/audit?scope=&snapshot_id=&limit=` | `impact.auto/impact.override/topology.publish` 审计 |
+| 页面 | `/impact` | 拓扑发布、闭包计算、边解释、人工排除和审计操作页 |
 
 ### 验证（Runner 协议）
 | 方法 | 路径 | 说明 |
@@ -201,7 +239,8 @@ ZIP 内固定包含 `MANIFEST.json`、`SIGNATURES.json`、`TRUST.json`、`PROOFS
 ## 典型时序（一次合规发布）
 
 ```
-create → freeze → (Runner: inputs→自算指纹→results) ×依赖图
+create（自动计算影响闭包，设计者可附理由排除可选节点）
+  → freeze（校验闭包/拓扑仍当前）→ (Runner: inputs→自算指纹→results) ×依赖图
        → TIMING_LEAD signoff → METHODOLOGY_LEAD signoff(不同人)
        → release(阶段1锁状态 → 阶段2原子写 B-R{n}、推进 trunk)
 ```

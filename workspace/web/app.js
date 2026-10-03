@@ -6,7 +6,9 @@ const STATUS_CN = {
   RELEASED: "已发布", ABORTED: "已中止", MERGED: "已并入他单",
 };
 const CHECK_CN = {TIMING_STA: "时序STA", POWER_ANALYSIS: "功耗", FORMAL_EQUIV: "形式验证",
-                  LAYOUT_DRC: "版图DRC", LINT_INFO: "Lint(非必需)"};
+                  LAYOUT_DRC: "版图DRC", LINT_INFO: "Lint(非必需)",
+                  CDC_VERIFY:"CDC复验", INTERFACE_CONTRACT_CHECK:"接口契约",
+                  CONSTRAINT_REFERENCE_CHECK:"约束引用", CLOCK_TREE_REVIEW:"时钟树"};
 const ROLE_CN = {TIMING_LEAD: "时序负责人", METHODOLOGY_LEAD: "方法学负责人"};
 const DLG_STATE_CN = {ACTIVE: "生效中", PENDING: "待生效", EXPIRED: "已过期", REVOKED: "已撤销"};
 
@@ -210,6 +212,17 @@ function checkTable(gate) {
       <td class="mut">${esc(c.runner_id||"")}</td></tr>`).join("") + "</table>";
 }
 
+function impactLine(e) {
+  const im = e.impact;
+  if (!im) return '<div class="row bad">缺少电路影响闭包，不能进入审核</div>';
+  const good = im.usable_for_review;
+  return `<div class="row ${good?'mut':'bad'}">电路影响闭包:
+    <a href="/impact" target="_blank" class="chip ${good?'ok':'bad'}">${good?'当前可用':'旧/不可用'}</a>
+    <span class="mono">${esc(im.snapshot_id)}</span>
+    拓扑v${im.topology_version} · ${im.accepted_nodes.length}个实例 · ${im.check_types.length}类检查
+    ${im.excluded_nodes.length?` · 已排除 ${im.excluded_nodes.map(esc).join(",")}`:""}</div>`;
+}
+
 function renderEcos(w) {
   $("ecos").innerHTML = w.ecos.map(e => {
     const g = e.gate;
@@ -271,6 +284,7 @@ function renderEcos(w) {
         &nbsp;|&nbsp; 纪元 e${e.freeze_epoch}
         &nbsp;|&nbsp; 门禁: <b class="${g.green?'ok':'bad'}">${g.green?'必需检查全绿':'未全绿'}</b>
         &nbsp;|&nbsp; 双签: <b class="${g.dual_role_complete?'ok':'warn'}">${g.dual_role_complete?'完成':'待签'}</b></div>
+      ${impactLine(e)}
       <div class="row">${sigs||'<span class="mut">（暂无有效签核）</span>'}</div>
       ${voided?`<div class="row mut">已失效旧签核（ECO 重新冻结，记录保留审计）：${voided}</div>`:""}
       ${e.fingerprint?`<div class="row mut mono">基线指纹 ${e.fingerprint} · 约束v${e.constraints_version_at_freeze}</div>`:""}
